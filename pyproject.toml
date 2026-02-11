@@ -17,6 +17,11 @@ dependencies = [
 dev = [
     "pytest>=7.0",
 ]
+evm = [
+    "web3>=6.0.0",
+    "eth-account>=0.10.0",
+    "eth-utils>=2.0.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["agentmesh*"]
