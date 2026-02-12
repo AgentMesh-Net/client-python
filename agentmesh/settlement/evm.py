@@ -9,7 +9,9 @@ Environment variables (all overridable via constructor args):
     AMN_EVM_PRIVATE_KEY   – hex-encoded private key
     AMN_ESCROW_ADDRESS    – deployed AgentMeshEscrow address
     AMN_EVM_CHAIN_ID      – chain id (default 31337 for Anvil)
-    AMN_EVM_TIMEOUT       – tx wait timeout in seconds (default 30)
+    AMN_TX_TIMEOUT        – tx wait timeout in seconds (default 30)
+    AMN_EVM_TIMEOUT       – legacy alias for AMN_TX_TIMEOUT
+    AMN_TX_POLL           – poll latency in seconds (default 2)
 """
 
 from __future__ import annotations
@@ -21,8 +23,10 @@ from typing import Any
 
 from eth_account import Account
 from eth_utils import keccak
+from hexbytes import HexBytes
 from web3 import Web3
 from web3._utils.events import EventLogErrorFlags
+from web3.exceptions import TimeExhausted
 
 # ---------------------------------------------------------------------------
 # ABI loading
@@ -80,6 +84,7 @@ class EvmEscrowClient:
         contract_address: str | None = None,
         chain_id: int | None = None,
         timeout: int | None = None,
+        poll_latency: int | None = None,
     ):
         self.rpc_url = rpc_url or os.environ.get(
             "AMN_EVM_RPC_URL", "http://localhost:8545"
@@ -91,7 +96,12 @@ class EvmEscrowClient:
         self.chain_id = chain_id or int(
             os.environ.get("AMN_EVM_CHAIN_ID", "31337")
         )
-        self.timeout = timeout or int(os.environ.get("AMN_EVM_TIMEOUT", "30"))
+        # Support both AMN_TX_TIMEOUT (preferred) and AMN_EVM_TIMEOUT (legacy)
+        self.timeout = timeout or int(
+            os.environ.get("AMN_TX_TIMEOUT") or 
+            os.environ.get("AMN_EVM_TIMEOUT", "30")
+        )
+        self.poll_latency = poll_latency or int(os.environ.get("AMN_TX_POLL", "2"))
 
         self.w3 = Web3(Web3.HTTPProvider(self.rpc_url))
         self.account = Account.from_key(pk)
@@ -101,6 +111,11 @@ class EvmEscrowClient:
         self.contract = self.w3.eth.contract(
             address=self.contract_address, abi=abi
         )
+
+    @classmethod
+    def from_env(cls) -> "EvmEscrowClient":
+        """Build adapter from environment variables."""
+        return cls()
 
     # -- internal tx helpers ------------------------------------------------
 
@@ -176,15 +191,97 @@ class EvmEscrowClient:
             "feeBps": self.contract.functions.feeBps().call(),
         }
 
-    def wait_receipt(self, tx_hash: bytes) -> dict:
-        """Block until tx is mined and return the receipt."""
-        return self.w3.eth.wait_for_transaction_receipt(
-            tx_hash, timeout=self.timeout
-        )
+    def wait_receipt(self, tx_hash: bytes | str) -> dict:
+        """Block until tx is mined and return the receipt.
+        
+        Raises:
+            SettlementTimeout: If transaction is not confirmed within timeout period.
+                This doesn't mean the transaction failed - check the explorer link.
+        """
+        from .exceptions import SettlementTimeout
+        
+        tx_hash = self._normalize_tx_hash(tx_hash)
+        try:
+            return self.w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=self.timeout, poll_latency=self.poll_latency
+            )
+        except TimeExhausted:
+            tx_hex = tx_hash.hex() if tx_hash.hex().startswith("0x") else f"0x{tx_hash.hex()}"
+            explorer_url = self._get_explorer_url(tx_hex)
+            
+            error_msg = (
+                f"\n\n⏱️  Transaction confirmation timeout after {self.timeout} seconds\n\n"
+                f"This doesn't mean the transaction failed! The timeout expired while waiting\n"
+                f"for the blockchain to confirm your transaction, but it may still succeed.\n\n"
+                f"Transaction: {tx_hex}\n"
+                f"Check status: {explorer_url}\n\n"
+                f"To avoid this timeout in the future, increase the wait time:\n"
+                f"  export AMN_TX_TIMEOUT=\"120\"  # seconds\n\n"
+                f"You can also check manually:\n"
+                f"  cast receipt {tx_hex} --rpc-url $AMN_EVM_RPC_URL\n\n"
+                f"Current timeout: {self.timeout}s\n"
+            )
+            
+            # Add network-specific suggestions
+            if self.chain_id == 11155111:  # Sepolia
+                error_msg += "Suggested timeout for Sepolia: 120s\n"
+            elif self.chain_id == 1:  # Mainnet
+                error_msg += "Suggested timeout for Mainnet: 180s\n"
+            elif self.chain_id in [5, 421613]:  # Goerli, Arbitrum Goerli
+                error_msg += "Suggested timeout for testnets: 120s\n"
+            
+            raise SettlementTimeout(error_msg) from None
 
-    def tx_failure_details(self, tx_hash: bytes) -> str:
+    def _get_explorer_url(self, tx_hash: str) -> str:
+        """Generate blockchain explorer URL for a transaction hash.
+        
+        Args:
+            tx_hash: Transaction hash with 0x prefix
+            
+        Returns:
+            Full URL to view transaction on appropriate explorer
+        """
+        # Ensure 0x prefix
+        if not tx_hash.startswith("0x"):
+            tx_hash = f"0x{tx_hash}"
+        
+        # Map chain IDs to explorer base URLs
+        explorers = {
+            1: "https://etherscan.io",           # Ethereum Mainnet
+            5: "https://goerli.etherscan.io",    # Goerli Testnet
+            11155111: "https://sepolia.etherscan.io",  # Sepolia Testnet
+            10: "https://optimistic.etherscan.io",     # Optimism
+            42161: "https://arbiscan.io",        # Arbitrum One
+            137: "https://polygonscan.com",      # Polygon
+            # Local/dev chains - no explorer
+            31337: None,  # Anvil
+            1337: None,   # Hardhat
+        }
+        
+        base_url = explorers.get(self.chain_id)
+        if base_url:
+            return f"{base_url}/tx/{tx_hash}"
+        else:
+            # For unknown chains or local networks
+            return f"No explorer available for chain {self.chain_id}. Transaction: {tx_hash}"
+    
+    def _normalize_tx_hash(self, tx_hash: bytes | str) -> HexBytes:
+        """Normalize bytes/hex-string tx hash into HexBytes."""
+        if isinstance(tx_hash, (bytes, bytearray)):
+            return HexBytes(tx_hash)
+        if isinstance(tx_hash, str):
+            s = tx_hash.strip()
+            if not s.startswith("0x"):
+                s = "0x" + s
+            return HexBytes(s)
+        raise TypeError(f"unsupported tx_hash type: {type(tx_hash)!r}")
+
+    def tx_failure_details(self, tx_hash: bytes | str) -> str:
         """Best-effort failure details for a reverted transaction."""
-        tx_hex = tx_hash.hex() if isinstance(tx_hash, (bytes, bytearray)) else str(tx_hash)
+        tx_hash = self._normalize_tx_hash(tx_hash)
+        tx_hex = tx_hash.hex()
+        if not tx_hex.startswith("0x"):
+            tx_hex = "0x" + tx_hex
         details = [f"tx={tx_hex}"]
         try:
             tx = self.w3.eth.get_transaction(tx_hash)
@@ -254,3 +351,7 @@ class EvmEscrowClient:
                     }
                 )
         return events
+
+
+# Preferred public adapter alias used by higher-level settlement service/demo.
+EVMAdapter = EvmEscrowClient

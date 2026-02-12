@@ -1,13 +1,59 @@
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
-build/
-.eggs/
-*.egg
-.venv/
-venv/
+*.pyo
+*.pyd
+*.so
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# Build / packaging
+build/
+dist/
+.eggs/
+*.egg
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Coverage / test artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+.envrc
+.direnv/
+.python-version
 *.pem
 *.key
+
+# Logs / temp files
+*.log
+*.tmp
+*.pid
+*.swp
+*.swo
+
+# IDE / OS files
+.idea/
+.vscode/
+.DS_Store
+.cache/
+.ipynb_checkpoints/
+
+# Local agent/tooling folders
+.claude/
